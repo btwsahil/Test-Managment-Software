@@ -6,11 +6,15 @@ from auth import verify_password, create_access_token, get_current_user, require
 from questions import router as questions_router
 from students import router as students_router
 from assignments import router as assignments_router
+from student_test import router as student_test_router
+from results import router as results_router
 
 app = FastAPI(title="Test Platform API")
 app.include_router(questions_router)
 app.include_router(students_router)
 app.include_router(assignments_router)
+app.include_router(student_test_router)
+app.include_router(results_router)
 
 app.add_middleware(
     CORSMiddleware,

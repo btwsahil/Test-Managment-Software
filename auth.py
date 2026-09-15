@@ -65,3 +65,13 @@ def require_admin(current_user: dict = Depends(get_current_user)):
     if current_user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     return current_user
+
+
+def require_student(current_user: dict = Depends(get_current_user)):
+    """
+    Use this instead of get_current_user on routes ONLY students should access.
+    Rejects the request with 403 Forbidden if the logged-in user isn't a student.
+    """
+    if current_user.get("role") != "student":
+        raise HTTPException(status_code=403, detail="Student access required")
+    return current_user
