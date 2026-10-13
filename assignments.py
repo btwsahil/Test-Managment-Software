@@ -1,19 +1,36 @@
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List
 from database import get_connection
 from auth import require_admin
 
 router = APIRouter()
 
+MINUTES_PER_QUESTION = 1.5
+MAX_BULK_STUDENTS = 85
 
-# ---------- Request/response shapes ----------
+
 class CreateAssignmentRequest(BaseModel):
     student_id: int
     subject_id: int
-    topic_id: Optional[int] = None  # None = mixed topics across the whole subject
-    num_questions: int
-    time_limit_minutes: Optional[int] = None  # if not given, we auto-calculate
+    topic_id: Optional[int] = None
+    num_questions: int = Field(gt=0)
+    time_limit_minutes: Optional[int] = Field(default=None, gt=0)
+    easy_questions: int = Field(default=0, ge=0)
+    medium_questions: int = Field(default=0, ge=0)
+    hard_questions: int = Field(default=0, ge=0)
+
+
+class BulkCreateAssignmentRequest(BaseModel):
+    student_ids: List[int] = Field(min_length=1, max_length=MAX_BULK_STUDENTS)
+    semester: int = Field(ge=1, le=8)
+    subject_id: int
+    topic_id: Optional[int] = None
+    num_questions: int = Field(gt=0)
+    time_limit_minutes: Optional[int] = Field(default=None, gt=0)
+    easy_questions: int = Field(default=0, ge=0)
+    medium_questions: int = Field(default=0, ge=0)
+    hard_questions: int = Field(default=0, ge=0)
 
 
 class AssignmentResponse(BaseModel):
@@ -29,89 +46,124 @@ class AssignmentResponse(BaseModel):
     status: str
 
 
-MINUTES_PER_QUESTION = 1.5  # used only when admin doesn't specify a time limit
+def _validate_difficulty_counts(request):
+    total = request.easy_questions + request.medium_questions + request.hard_questions
+    if total not in (0, request.num_questions):
+        raise HTTPException(
+            status_code=400,
+            detail="Easy + Medium + Hard must equal num_questions, or all three must be 0 for Mixed.",
+        )
+
+
+def _validate_test_config(cursor, request):
+    _validate_difficulty_counts(request)
+
+    cursor.execute(
+        "SELECT subject_id, subject_name FROM subjects WHERE subject_id = %s",
+        (request.subject_id,),
+    )
+    subject = cursor.fetchone()
+    if not subject:
+        raise HTTPException(status_code=404, detail="Subject not found")
+
+    topic_name = None
+    if request.topic_id is not None:
+        cursor.execute(
+            """
+            SELECT topic_id, topic_name
+            FROM topics
+            WHERE topic_id = %s AND subject_id = %s
+            """,
+            (request.topic_id, request.subject_id),
+        )
+        topic = cursor.fetchone()
+        if not topic:
+            raise HTTPException(status_code=404, detail="Topic not found for this subject")
+        topic_name = topic["topic_name"]
+
+    where = "subject_id = %s"
+    params = [request.subject_id]
+    if request.topic_id is not None:
+        where += " AND topic_id = %s"
+        params.append(request.topic_id)
+
+    if request.easy_questions + request.medium_questions + request.hard_questions == 0:
+        cursor.execute(f"SELECT COUNT(*) AS count FROM questions WHERE {where}", tuple(params))
+        available = cursor.fetchone()["count"]
+        if available < request.num_questions:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Only {available} question(s) available, but {request.num_questions} requested.",
+            )
+    else:
+        for difficulty, needed in [
+            ("Easy", request.easy_questions),
+            ("Medium", request.medium_questions),
+            ("Hard", request.hard_questions),
+        ]:
+            if needed:
+                cursor.execute(
+                    f"SELECT COUNT(*) AS count FROM questions WHERE {where} AND difficulty = %s",
+                    tuple(params + [difficulty]),
+                )
+                available = cursor.fetchone()["count"]
+                if available < needed:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Only {available} {difficulty} question(s) available, but {needed} requested.",
+                    )
+
+    time_limit = request.time_limit_minutes
+    if time_limit is None:
+        time_limit = max(1, round(request.num_questions * MINUTES_PER_QUESTION))
+
+    return subject, topic_name, time_limit
 
 
 @router.post("/admin/assignments", response_model=AssignmentResponse)
 def create_assignment(request: CreateAssignmentRequest, admin_user: dict = Depends(require_admin)):
-    """
-    Admin assigns a test to a student: picks the student, subject, optionally
-    a specific topic, how many questions, and a time limit. If no time limit
-    is given, we calculate one automatically based on question count.
-    """
-    if request.num_questions <= 0:
-        raise HTTPException(status_code=400, detail="num_questions must be greater than 0")
-
     conn = get_connection()
     cursor = conn.cursor()
 
-    # Validate the student exists and is actually a student
-    cursor.execute("SELECT user_id, name FROM users WHERE user_id = %s AND role = 'student'", (request.student_id,))
+    cursor.execute(
+        "SELECT user_id, name FROM users WHERE user_id = %s AND role = 'student'",
+        (request.student_id,),
+    )
     student = cursor.fetchone()
     if not student:
         cursor.close()
         conn.close()
         raise HTTPException(status_code=404, detail="Student not found")
 
-    # Validate the subject exists
-    cursor.execute("SELECT subject_id, subject_name FROM subjects WHERE subject_id = %s", (request.subject_id,))
-    subject = cursor.fetchone()
-    if not subject:
+    try:
+        subject, topic_name, time_limit = _validate_test_config(cursor, request)
+        cursor.execute(
+            """
+            INSERT INTO assignments
+                (student_id, subject_id, topic_id, num_questions,
+                 time_limit_minutes, status, assigned_by,
+                 easy_questions, medium_questions, hard_questions)
+            VALUES (%s, %s, %s, %s, %s, 'pending', %s, %s, %s, %s)
+            RETURNING assignment_id;
+            """,
+            (
+                request.student_id, request.subject_id, request.topic_id,
+                request.num_questions, time_limit, admin_user["sub"],
+                request.easy_questions, request.medium_questions, request.hard_questions,
+            ),
+        )
+        new_id = cursor.fetchone()["assignment_id"]
+        conn.commit()
+    except HTTPException:
         cursor.close()
         conn.close()
-        raise HTTPException(status_code=404, detail="Subject not found")
-
-    # If a topic was specified, validate it exists AND belongs to this subject
-    topic_name = None
-    if request.topic_id is not None:
-        cursor.execute(
-            "SELECT topic_id, topic_name FROM topics WHERE topic_id = %s AND subject_id = %s",
-            (request.topic_id, request.subject_id),
-        )
-        topic = cursor.fetchone()
-        if not topic:
-            cursor.close()
-            conn.close()
-            raise HTTPException(status_code=404, detail="Topic not found for this subject")
-        topic_name = topic["topic_name"]
-
-    # Check there are ENOUGH questions available to actually fulfill this assignment
-    if request.topic_id is not None:
-        cursor.execute(
-            "SELECT COUNT(*) as count FROM questions WHERE subject_id = %s AND topic_id = %s",
-            (request.subject_id, request.topic_id),
-        )
-    else:
-        cursor.execute(
-            "SELECT COUNT(*) as count FROM questions WHERE subject_id = %s",
-            (request.subject_id,),
-        )
-    available = cursor.fetchone()["count"]
-    if available < request.num_questions:
+        raise
+    except Exception:
+        conn.rollback()
         cursor.close()
         conn.close()
-        raise HTTPException(
-            status_code=400,
-            detail=f"Only {available} question(s) available for this subject/topic, but {request.num_questions} were requested",
-        )
+        raise
 
-    # Calculate a time limit automatically if the admin didn't set one
-    time_limit = request.time_limit_minutes
-    if time_limit is None:
-        time_limit = max(1, round(request.num_questions * MINUTES_PER_QUESTION))
-
-    cursor.execute(
-        """
-        INSERT INTO assignments
-            (student_id, subject_id, topic_id, num_questions, time_limit_minutes, status, assigned_by)
-        VALUES (%s, %s, %s, %s, %s, 'pending', %s)
-        RETURNING assignment_id;
-        """,
-        (request.student_id, request.subject_id, request.topic_id,
-         request.num_questions, time_limit, admin_user["sub"]),
-    )
-    new_id = cursor.fetchone()["assignment_id"]
-    conn.commit()
     cursor.close()
     conn.close()
 
@@ -129,9 +181,102 @@ def create_assignment(request: CreateAssignmentRequest, admin_user: dict = Depen
     )
 
 
+@router.post("/admin/assignments/bulk")
+def create_bulk_assignments(
+    request: BulkCreateAssignmentRequest,
+    admin_user: dict = Depends(require_admin),
+):
+    """
+    Creates the SAME test configuration for every selected student in one
+    semester. Maximum 85 students per request.
+    """
+    if len(set(request.student_ids)) != len(request.student_ids):
+        raise HTTPException(status_code=400, detail="Duplicate student IDs were selected.")
+
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    try:
+        placeholders = ",".join(["%s"] * len(request.student_ids))
+        cursor.execute(
+            f"""
+            SELECT user_id, name, semester
+            FROM users
+            WHERE role = 'student'
+              AND user_id IN ({placeholders})
+            """,
+            tuple(request.student_ids),
+        )
+        rows = cursor.fetchall()
+
+        found = {row["user_id"]: row for row in rows}
+        missing = [sid for sid in request.student_ids if sid not in found]
+        if missing:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Student(s) not found: {missing}",
+            )
+
+        wrong_semester = [
+            row["user_id"]
+            for row in rows
+            if row["semester"] != request.semester
+        ]
+        if wrong_semester:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Some selected students are not in semester {request.semester}: {wrong_semester}",
+            )
+
+        subject, topic_name, time_limit = _validate_test_config(cursor, request)
+
+        assignment_ids = []
+        for student_id in request.student_ids:
+            cursor.execute(
+                """
+                INSERT INTO assignments
+                    (student_id, subject_id, topic_id, num_questions,
+                     time_limit_minutes, status, assigned_by,
+                     easy_questions, medium_questions, hard_questions)
+                VALUES (%s, %s, %s, %s, %s, 'pending', %s, %s, %s, %s)
+                RETURNING assignment_id;
+                """,
+                (
+                    student_id, request.subject_id, request.topic_id,
+                    request.num_questions, time_limit, admin_user["sub"],
+                    request.easy_questions, request.medium_questions, request.hard_questions,
+                ),
+            )
+            assignment_ids.append(cursor.fetchone()["assignment_id"])
+
+        conn.commit()
+
+        return {
+            "message": f"Test assigned to {len(assignment_ids)} student(s).",
+            "semester": request.semester,
+            "student_count": len(assignment_ids),
+            "assignment_ids": assignment_ids,
+            "subject_id": request.subject_id,
+            "subject_name": subject["subject_name"],
+            "topic_id": request.topic_id,
+            "topic_name": topic_name,
+            "num_questions": request.num_questions,
+            "time_limit_minutes": time_limit,
+        }
+
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Bulk assignment failed: {e}")
+    finally:
+        cursor.close()
+        conn.close()
+
+
 @router.get("/admin/assignments", response_model=List[AssignmentResponse])
 def list_assignments(admin_user: dict = Depends(require_admin)):
-    """Lists all test assignments across all students, most recent first."""
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(

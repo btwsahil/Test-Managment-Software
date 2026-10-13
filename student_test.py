@@ -185,22 +185,63 @@ def start_test(assignment_id: int, student_user: dict = Depends(require_student)
             start_time=start_time, questions=questions_out,
         )
 
-    # No existing session - create a fresh one, pick and shuffle questions
+    # No existing session - create a fresh one. Difficulty distribution is
+    # stored on the assignment, so the server selects the exact requested
+    # number from each difficulty level. If all three are zero, preserve the
+    # old mixed-random behavior.
     if assignment["topic_id"] is not None:
-        cursor.execute(
-            "SELECT * FROM questions WHERE subject_id = %s AND topic_id = %s",
-            (assignment["subject_id"], assignment["topic_id"]),
-        )
+        base_sql = "SELECT * FROM questions WHERE subject_id = %s AND topic_id = %s"
+        base_params = [assignment["subject_id"], assignment["topic_id"]]
     else:
-        cursor.execute("SELECT * FROM questions WHERE subject_id = %s", (assignment["subject_id"],))
-    all_questions = cursor.fetchall()
+        base_sql = "SELECT * FROM questions WHERE subject_id = %s"
+        base_params = [assignment["subject_id"]]
 
-    if len(all_questions) < assignment["num_questions"]:
-        cursor.close()
-        conn.close()
-        raise HTTPException(status_code=400, detail="Not enough questions available to start this test")
+    distribution = [
+        ("Easy", int(assignment.get("easy_questions") or 0)),
+        ("Medium", int(assignment.get("medium_questions") or 0)),
+        ("Hard", int(assignment.get("hard_questions") or 0)),
+    ]
 
-    chosen = random.sample(all_questions, assignment["num_questions"])
+    if sum(count for _, count in distribution) == 0:
+        cursor.execute(base_sql, tuple(base_params))
+        all_questions = cursor.fetchall()
+
+        if len(all_questions) < assignment["num_questions"]:
+            cursor.close()
+            conn.close()
+            raise HTTPException(
+                status_code=400,
+                detail="Not enough questions available to start this test",
+            )
+
+        chosen = random.sample(all_questions, assignment["num_questions"])
+    else:
+        chosen = []
+
+        for difficulty, count in distribution:
+            if count == 0:
+                continue
+
+            cursor.execute(
+                base_sql + " AND difficulty = %s",
+                tuple(base_params + [difficulty]),
+            )
+            available = cursor.fetchall()
+
+            if len(available) < count:
+                cursor.close()
+                conn.close()
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Not enough {difficulty} questions available. "
+                        f"Required {count}, found {len(available)}."
+                    ),
+                )
+
+            chosen.extend(random.sample(available, count))
+
+        random.shuffle(chosen)
 
     cursor.execute(
         "INSERT INTO sessions (assignment_id, start_time) VALUES (%s, NOW()) RETURNING session_id, start_time;",

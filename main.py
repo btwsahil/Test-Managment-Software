@@ -3,29 +3,32 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from database import get_connection
 from auth import verify_password, create_access_token, get_current_user, require_admin
+import bcrypt
 from questions import router as questions_router
 from students import router as students_router
 from assignments import router as assignments_router
 from student_test import router as student_test_router
 from results import router as results_router
+from student_portal import router as student_portal_router
 
 app = FastAPI(title="Test Platform API")
+
 app.include_router(questions_router)
 app.include_router(students_router)
 app.include_router(assignments_router)
 app.include_router(student_test_router)
 app.include_router(results_router)
+app.include_router(student_portal_router)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten this to your actual frontend URL before going live
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ---------- Request/response shapes ----------
 class LoginRequest(BaseModel):
     username: str
     password: str
@@ -38,7 +41,10 @@ class LoginResponse(BaseModel):
     must_change_password: bool
 
 
-# ---------- Basic endpoints ----------
+class ChangePasswordRequest(BaseModel):
+    new_password: str
+
+
 @app.get("/")
 def root():
     return {"message": "Test Platform API is running"}
@@ -58,7 +64,6 @@ def test_db_connection():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ---------- Login ----------
 @app.post("/login", response_model=LoginResponse)
 def login(credentials: LoginRequest):
     conn = get_connection()
@@ -83,7 +88,32 @@ def login(credentials: LoginRequest):
     )
 
 
-# ---------- Example protected route (temporary, to prove it works) ----------
 @app.get("/admin/me")
 def admin_only_test(admin_user: dict = Depends(require_admin)):
     return {"message": "You are logged in as an admin", "user": admin_user}
+
+
+@app.post("/change-password")
+def change_password(
+    request: ChangePasswordRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    if len(request.new_password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+
+    hashed = bcrypt.hashpw(
+        request.new_password.encode("utf-8"),
+        bcrypt.gensalt(),
+    ).decode("utf-8")
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE users SET password_hash = %s, must_change_password = false WHERE user_id = %s",
+        (hashed, current_user["sub"]),
+    )
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    return {"status": "password updated"}

@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional
+from datetime import datetime
 from database import get_connection
 from auth import require_admin
 
@@ -27,6 +28,19 @@ class StudentPerformance(BaseModel):
     tests_taken: int
     average_score: float
     weak_topics: List[str]  # aggregated across all their tests
+
+
+class SecurityViolationSummary(BaseModel):
+    violation_id: int
+    session_id: int
+    assignment_id: int
+    student_id: int
+    student_name: str
+    subject_name: str
+    topic_name: Optional[str]
+    violation_type: str
+    message: Optional[str]
+    occurred_at: datetime
 
 
 # ---------- Endpoints ----------
@@ -107,6 +121,48 @@ def student_results(student_id: int, admin_user: dict = Depends(require_admin)):
             total_questions=row["total_questions"], correct_answers=row["correct_answers"],
             wrong_answers=row["wrong_answers"], score_percent=float(row["score_percent"]),
             weak_topics=row["weak_topics"].split(",") if row["weak_topics"] else [],
+        )
+        for row in rows
+    ]
+
+
+@router.get("/admin/security/violations", response_model=List[SecurityViolationSummary])
+def list_security_violations(admin_user: dict = Depends(require_admin)):
+    """Return the exam-security audit trail for all completed and active sessions."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT
+            ev.violation_id, ev.session_id, a.assignment_id,
+            u.user_id AS student_id, u.name AS student_name,
+            s.subject_name, t.topic_name,
+            ev.violation_type, ev.message, ev.occurred_at
+        FROM exam_violations ev
+        JOIN sessions se ON ev.session_id = se.session_id
+        JOIN assignments a ON se.assignment_id = a.assignment_id
+        JOIN users u ON a.student_id = u.user_id
+        JOIN subjects s ON a.subject_id = s.subject_id
+        LEFT JOIN topics t ON a.topic_id = t.topic_id
+        ORDER BY ev.occurred_at DESC, ev.violation_id DESC;
+        """
+    )
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    return [
+        SecurityViolationSummary(
+            violation_id=row["violation_id"],
+            session_id=row["session_id"],
+            assignment_id=row["assignment_id"],
+            student_id=row["student_id"],
+            student_name=row["student_name"],
+            subject_name=row["subject_name"],
+            topic_name=row["topic_name"],
+            violation_type=row["violation_type"],
+            message=row["message"],
+            occurred_at=row["occurred_at"],
         )
         for row in rows
     ]
